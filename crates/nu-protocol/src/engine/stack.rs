@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::engine::EngineState;
 use crate::engine::DEFAULT_OVERLAY_NAME;
@@ -26,7 +26,7 @@ pub type EnvVars = HashMap<String, HashMap<String, Value>>;
 /// in any context. This meant that the parents were going largely unused, with captured variables
 /// taking their place. The end result is this, where we no longer have separate frames, but instead
 /// use the Stack as a way of representing the local and closure-captured state.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Stack {
     /// Variables
     pub vars: Vec<(VarId, Value)>,
@@ -38,23 +38,8 @@ pub struct Stack {
     pub active_overlays: Vec<String>,
     pub recursion_count: u64,
 
-    pub parent_stack: Option<Arc<Stack>>,
+    pub parent_stack: Option<Arc<Mutex<Stack>>>,
     pub parent_deletions: Vec<VarId>,
-}
-
-impl Clone for Stack {
-    fn clone(&self) -> Self {
-        eprintln!("STACK CLONED");
-        Self {
-            vars: self.vars.clone(),
-            env_vars: self.env_vars.clone(),
-            env_hidden: self.env_hidden.clone(),
-            active_overlays: self.active_overlays.clone(),
-            recursion_count: self.recursion_count.clone(),
-            parent_stack: self.parent_stack.clone(),
-            parent_deletions: self.parent_deletions.clone(),
-        }
-    }
 }
 
 impl Stack {
@@ -70,7 +55,7 @@ impl Stack {
         }
     }
 
-    pub fn with_parent(parent: Arc<Stack>) -> Stack {
+    pub fn with_parent(parent: Arc<Mutex<Stack>>) -> Stack {
         Stack {
             vars: vec![],
             env_vars: vec![],
@@ -104,8 +89,11 @@ impl Stack {
             }
         }
 
-        if self.parent_stack.is_some() && !self.parent_deletions.contains(&var_id) {
-            return self.parent_stack.as_deref().unwrap().get_var(var_id, span);
+        if let Some(mutex) = &self.parent_stack {
+            if !self.parent_deletions.contains(&var_id) {
+                let stack = mutex.lock().expect("Deadlock on parent stack analysis");
+                return stack.get_var(var_id, span);
+            }
         }
         Err(ShellError::VariableNotFoundAtRuntime { span })
     }
@@ -117,12 +105,11 @@ impl Stack {
             }
         }
 
-        if self.parent_stack.is_some() && !self.parent_deletions.contains(&var_id) {
-            return self
-                .parent_stack
-                .as_deref()
-                .unwrap()
-                .get_var_with_origin(var_id, span);
+        if let Some(mutex) = &self.parent_stack {
+            if !self.parent_deletions.contains(&var_id) {
+                let stack = mutex.lock().expect("Deadlock on parent stack access");
+                return stack.get_var_with_origin(var_id, span);
+            }
         }
         if var_id == NU_VARIABLE_ID || var_id == ENV_VARIABLE_ID {
             return Err(ShellError::GenericError {

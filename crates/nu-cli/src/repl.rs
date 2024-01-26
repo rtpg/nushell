@@ -29,7 +29,7 @@ use std::{
     env::temp_dir,
     io::{self, IsTerminal, Write},
     path::Path,
-    sync::{atomic::Ordering, Arc},
+    sync::{atomic::Ordering, Arc, Mutex},
     time::Instant,
 };
 use sysinfo::SystemExt;
@@ -44,10 +44,32 @@ const PRE_EXECUTE_MARKER: &str = "\x1b]133;C\x1b\\";
 // const CMD_FINISHED_MARKER: &str = "\x1b]133;D;{}\x1b\\";
 const RESET_APPLICATION_MODE: &str = "\x1b[?1l";
 
-pub fn am(s: &mut Arc<Stack>) -> &mut Stack {
-    return Arc::get_mut(s).expect("Shared reference exist! Copy would have happened");
+trait SharedStack {
+    fn convert_env_values(&self, engine_state: &mut EngineState) -> Option<ShellError>;
+    fn add_env_var(&self, var: String, value: Value);
+    fn get_env_var(&self, envine_state: &EngineState, var: &str) -> Option<Value>;
+    fn child_stack(&self) -> Stack;
 }
 
+impl SharedStack for Arc<Mutex<Stack>> {
+    fn convert_env_values(&self, engine_state: &mut EngineState) -> Option<ShellError> {
+        let mut stack = self.lock().unwrap();
+        return convert_env_values(engine_state, &mut stack);
+    }
+
+    fn add_env_var(&self, var: String, value: Value) {
+        let mut stack = self.lock().unwrap();
+        stack.add_env_var(var, value);
+    }
+
+    fn get_env_var(&self, engine_state: &EngineState, var: &str) -> Option<Value> {
+        let stack = self.lock().unwrap();
+        stack.get_env_var(engine_state, var)
+    }
+    fn child_stack(&self) -> Stack {
+        return Stack::with_parent(self.clone());
+    }
+}
 pub fn evaluate_repl(
     engine_state: &mut EngineState,
     stack: &mut Stack,
@@ -59,7 +81,7 @@ pub fn evaluate_repl(
     use nu_cmd_base::hook;
     use reedline::Signal;
 
-    let mut stack = Arc::new(stack.clone());
+    let stack = Arc::new(Mutex::new(stack.clone()));
     let use_color = engine_state.get_config().use_ansi_coloring;
 
     // Guard against invocation without a connected terminal.
@@ -78,7 +100,7 @@ pub fn evaluate_repl(
 
     let start_time = std::time::Instant::now();
     // Translate environment variables from Strings to Values
-    if let Some(e) = convert_env_values(engine_state, &mut stack) {
+    if let Some(e) = stack.convert_env_values(engine_state) {
         let working_set = StateWorkingSet::new(engine_state);
         report_error(&working_set, &e);
     }
@@ -92,12 +114,12 @@ pub fn evaluate_repl(
     );
 
     // seed env vars
-    am(&mut stack).add_env_var(
+    stack.add_env_var(
         "CMD_DURATION_MS".into(),
         Value::string("0823", Span::unknown()),
     );
 
-    am(&mut stack).add_env_var("LAST_EXIT_CODE".into(), Value::int(0, Span::unknown()));
+    stack.add_env_var("LAST_EXIT_CODE".into(), Value::int(0, Span::unknown()));
 
     let mut start_time = std::time::Instant::now();
     let mut line_editor = Reedline::create();
@@ -152,16 +174,17 @@ pub fn evaluate_repl(
     );
 
     if let Some(s) = prerun_command {
+        let mut stack = stack.lock().unwrap();
         eval_source(
             engine_state,
-            am(&mut stack),
+            &mut stack,
             s.item.as_bytes(),
             &format!("entry #{entry_num}"),
             PipelineData::empty(),
             false,
         );
-        let cwd = get_guaranteed_cwd(engine_state, am(&mut stack));
-        engine_state.merge_env(am(&mut stack), cwd)?;
+        let cwd = get_guaranteed_cwd(engine_state, &mut stack);
+        engine_state.merge_env(&mut stack, cwd)?;
     }
 
     engine_state.set_startup_time(entire_start_time.elapsed().as_nanos() as i64);
@@ -171,9 +194,10 @@ pub fn evaluate_repl(
     engine_state.set_variable_const_val(NU_VARIABLE_ID, nu_const);
 
     if load_std_lib.is_none() && engine_state.get_config().show_banner {
+        let mut stack = stack.lock().unwrap();
         eval_source(
             engine_state,
-            am(&mut stack),
+            &mut stack,
             r#"use std banner; banner"#.as_bytes(),
             "show_banner",
             PipelineData::empty(),
@@ -188,13 +212,16 @@ pub fn evaluate_repl(
     loop {
         let loop_start_time = std::time::Instant::now();
 
-        let cwd = get_guaranteed_cwd(engine_state, &mut stack);
+        {
+            let mut stack = stack.lock().unwrap();
+            let cwd = get_guaranteed_cwd(engine_state, &mut stack);
 
-        start_time = std::time::Instant::now();
-        // Before doing anything, merge the environment from the previous REPL iteration into the
-        // permanent state.
-        if let Err(err) = engine_state.merge_env(Arc::make_mut(&mut stack), cwd) {
-            report_error_new(engine_state, &err);
+            start_time = std::time::Instant::now();
+            // Before doing anything, merge the environment from the previous REPL iteration into the
+            // permanent state.
+            if let Err(err) = engine_state.merge_env(&mut stack, cwd) {
+                report_error_new(engine_state, &err);
+            }
         }
         perf(
             "merge env",
@@ -269,7 +296,7 @@ pub fn evaluate_repl(
             }))
             .with_completer(Box::new(NuCompleter::new(
                 engine_reference.clone(),
-                Stack::with_parent(stack.clone()),
+                stack.child_stack(),
             )))
             .with_quick_completions(config.quick_completions)
             .with_partial_completions(config.partial_completions)
@@ -277,7 +304,7 @@ pub fn evaluate_repl(
             .with_cursor_config(cursor_config)
             .with_transient_prompt(prompt_update::transient_prompt(
                 engine_reference.clone(),
-                &Stack::with_parent(stack.clone()),
+                &stack.child_stack(),
             ));
         perf(
             "reedline builder",
@@ -288,11 +315,11 @@ pub fn evaluate_repl(
             use_color,
         );
 
-        let style_computer = StyleComputer::from_config(engine_state, &stack);
-
         start_time = std::time::Instant::now();
         line_editor = if config.use_ansi_coloring {
             line_editor.with_hinter(Box::new({
+                let stack = stack.lock().unwrap();
+                let style_computer = StyleComputer::from_config(engine_state, &stack);
                 // As of Nov 2022, "hints" color_config closures only get `null` passed in.
                 let style = style_computer.compute("hints", &Value::nothing(Span::unknown()));
                 CwdAwareHinter::default().with_style(style)
@@ -310,8 +337,8 @@ pub fn evaluate_repl(
         );
 
         start_time = std::time::Instant::now();
-        line_editor =
-            add_menus(line_editor, engine_reference, &stack, config).unwrap_or_else(|e| {
+        line_editor = add_menus(line_editor, engine_reference, &stack.child_stack(), config)
+            .unwrap_or_else(|e| {
                 let working_set = StateWorkingSet::new(engine_state);
                 report_error(&working_set, &e);
                 Reedline::create()
@@ -326,11 +353,7 @@ pub fn evaluate_repl(
         );
 
         start_time = std::time::Instant::now();
-        let buffer_editor = get_editor(
-            engine_state,
-            &mut Stack::with_parent(stack.clone()),
-            Span::unknown(),
-        );
+        let buffer_editor = get_editor(engine_state, &mut stack.child_stack(), Span::unknown());
 
         line_editor = if let Ok((cmd, args)) = buffer_editor {
             let mut command = std::process::Command::new(&cmd);
@@ -445,7 +468,12 @@ pub fn evaluate_repl(
 
         start_time = std::time::Instant::now();
         let config = &engine_state.get_config().clone();
-        let prompt = prompt_update::update_prompt(config, engine_state, &stack, &mut nu_prompt);
+        let prompt = prompt_update::update_prompt(
+            config,
+            engine_state,
+            &stack.child_stack(),
+            &mut nu_prompt,
+        );
         perf(
             "update_prompt",
             start_time,
@@ -511,7 +539,7 @@ pub fn evaluate_repl(
                 let start_time = Instant::now();
                 let tokens = lex(s.as_bytes(), 0, &[], &[], false);
                 // Check if this is a single call to a directory, if so auto-cd
-                let cwd = nu_engine::env::current_dir_str(engine_state, &stack)?;
+                let cwd = nu_engine::env::current_dir_str(engine_state, &stack.child_stack())?;
 
                 let mut orig = s.clone();
                 if orig.starts_with('`') {
@@ -539,13 +567,11 @@ pub fn evaluate_repl(
                         (path.to_string_lossy().to_string(), tokens.0[0].span)
                     };
 
-                    am(&mut stack)
-                        .add_env_var("OLDPWD".into(), Value::string(cwd.clone(), Span::unknown()));
+                    stack.add_env_var("OLDPWD".into(), Value::string(cwd.clone(), Span::unknown()));
 
                     //FIXME: this only changes the current scope, but instead this environment variable
                     //should probably be a block that loads the information from the state in the overlay
-                    am(&mut stack)
-                        .add_env_var("PWD".into(), Value::string(path.clone(), Span::unknown()));
+                    stack.add_env_var("PWD".into(), Value::string(path.clone(), Span::unknown()));
                     let cwd = Value::string(cwd, span);
 
                     let shells = stack.get_env_var(engine_state, "NUSHELL_SHELLS");
@@ -573,8 +599,8 @@ pub fn evaluate_repl(
 
                     shells[current_shell] = Value::string(path, span);
 
-                    am(&mut stack).add_env_var("NUSHELL_SHELLS".into(), Value::list(shells, span));
-                    am(&mut stack).add_env_var(
+                    stack.add_env_var("NUSHELL_SHELLS".into(), Value::list(shells, span));
+                    stack.add_env_var(
                         "NUSHELL_LAST_SHELL".into(),
                         Value::int(last_shell as i64, span),
                     );
@@ -602,21 +628,19 @@ pub fn evaluate_repl(
                         }
                     }
 
+                    let mut stack = stack.lock().unwrap();
                     eval_source(
                         engine_state,
-                        &mut Stack::with_parent(stack.clone()),
+                        &mut stack,
                         s.as_bytes(),
                         &format!("entry #{entry_num}"),
                         PipelineData::empty(),
                         false,
                     );
                 }
+                // we save the duration here, but will actually modify
+                // the stack later
                 let cmd_duration = start_time.elapsed();
-
-                am(&mut stack).add_env_var(
-                    "CMD_DURATION_MS".into(),
-                    Value::string(format!("{}", cmd_duration.as_millis()), Span::unknown()),
-                );
 
                 if history_supports_meta && !s.is_empty() && line_editor.has_last_command_context()
                 {
@@ -632,7 +656,10 @@ pub fn evaluate_repl(
                 }
 
                 if shell_integration {
-                    run_ansi_sequence(&get_command_finished_marker(&stack, engine_state))?;
+                    run_ansi_sequence(&get_command_finished_marker(
+                        &stack.child_stack(),
+                        engine_state,
+                    ))?;
                     if let Some(cwd) = stack.get_env_var(engine_state, "PWD") {
                         let path = cwd.as_string()?;
 
@@ -686,17 +713,27 @@ pub fn evaluate_repl(
                 repl.buffer = "".to_string();
                 repl.cursor_pos = 0;
                 drop(repl);
+                stack.add_env_var(
+                    "CMD_DURATION_MS".into(),
+                    Value::string(format!("{}", cmd_duration.as_millis()), Span::unknown()),
+                );
             }
             Ok(Signal::CtrlC) => {
                 // `Reedline` clears the line content. New prompt is shown
                 if shell_integration {
-                    run_ansi_sequence(&get_command_finished_marker(&stack, engine_state))?;
+                    run_ansi_sequence(&get_command_finished_marker(
+                        &stack.child_stack(),
+                        engine_state,
+                    ))?;
                 }
             }
             Ok(Signal::CtrlD) => {
                 // When exiting clear to a new line
                 if shell_integration {
-                    run_ansi_sequence(&get_command_finished_marker(&stack, engine_state))?;
+                    run_ansi_sequence(&get_command_finished_marker(
+                        &stack.child_stack(),
+                        engine_state,
+                    ))?;
                 }
                 println!();
                 break;
@@ -711,7 +748,10 @@ pub fn evaluate_repl(
                     // Alternatively only allow that expected failures let the REPL loop
                 }
                 if shell_integration {
-                    run_ansi_sequence(&get_command_finished_marker(&stack, engine_state))?;
+                    run_ansi_sequence(&get_command_finished_marker(
+                        &stack.child_stack(),
+                        engine_state,
+                    ))?;
                 }
             }
         }
