@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::engine::EngineState;
 use crate::engine::DEFAULT_OVERLAY_NAME;
@@ -25,7 +26,7 @@ pub type EnvVars = HashMap<String, HashMap<String, Value>>;
 /// in any context. This meant that the parents were going largely unused, with captured variables
 /// taking their place. The end result is this, where we no longer have separate frames, but instead
 /// use the Stack as a way of representing the local and closure-captured state.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Stack {
     /// Variables
     pub vars: Vec<(VarId, Value)>,
@@ -36,6 +37,24 @@ pub struct Stack {
     /// List of active overlays
     pub active_overlays: Vec<String>,
     pub recursion_count: u64,
+
+    pub parent_stack: Option<Arc<Stack>>,
+    pub parent_deletions: Vec<VarId>,
+}
+
+impl Clone for Stack {
+    fn clone(&self) -> Self {
+        eprintln!("STACK CLONED");
+        Self {
+            vars: self.vars.clone(),
+            env_vars: self.env_vars.clone(),
+            env_hidden: self.env_hidden.clone(),
+            active_overlays: self.active_overlays.clone(),
+            recursion_count: self.recursion_count.clone(),
+            parent_stack: self.parent_stack.clone(),
+            parent_deletions: self.parent_deletions.clone(),
+        }
+    }
 }
 
 impl Stack {
@@ -46,6 +65,20 @@ impl Stack {
             env_hidden: HashMap::new(),
             active_overlays: vec![DEFAULT_OVERLAY_NAME.to_string()],
             recursion_count: 0,
+            parent_stack: None,
+            parent_deletions: vec![],
+        }
+    }
+
+    pub fn with_parent(parent: Arc<Stack>) -> Stack {
+        Stack {
+            vars: vec![],
+            env_vars: vec![],
+            env_hidden: HashMap::new(),
+            active_overlays: vec![DEFAULT_OVERLAY_NAME.to_string()],
+            recursion_count: 0,
+            parent_stack: Some(parent),
+            parent_deletions: vec![],
         }
     }
 
@@ -71,6 +104,9 @@ impl Stack {
             }
         }
 
+        if self.parent_stack.is_some() && !self.parent_deletions.contains(&var_id) {
+            return self.parent_stack.as_deref().unwrap().get_var(var_id, span);
+        }
         Err(ShellError::VariableNotFoundAtRuntime { span })
     }
 
@@ -81,6 +117,13 @@ impl Stack {
             }
         }
 
+        if self.parent_stack.is_some() && !self.parent_deletions.contains(&var_id) {
+            return self
+                .parent_stack
+                .as_deref()
+                .unwrap()
+                .get_var_with_origin(var_id, span);
+        }
         if var_id == NU_VARIABLE_ID || var_id == ENV_VARIABLE_ID {
             return Err(ShellError::GenericError {
                 error: "Built-in variables `$env` and `$nu` have no metadata".into(),
@@ -91,7 +134,7 @@ impl Stack {
             });
         }
 
-        Err(ShellError::VariableNotFoundAtRuntime { span })
+        return Err(ShellError::VariableNotFoundAtRuntime { span });
     }
 
     pub fn add_var(&mut self, var_id: VarId, value: Value) {
@@ -111,6 +154,10 @@ impl Stack {
                 self.vars.remove(idx);
                 return;
             }
+        }
+        // we didn't find anything, but if it's in the parent stack we should still hide it
+        if self.parent_stack.is_some() {
+            self.parent_deletions.push(var_id);
         }
     }
 
@@ -160,6 +207,8 @@ impl Stack {
             env_hidden: self.env_hidden.clone(),
             active_overlays: self.active_overlays.clone(),
             recursion_count: self.recursion_count,
+            parent_stack: None,
+            parent_deletions: vec![],
         }
     }
 
@@ -187,6 +236,8 @@ impl Stack {
             env_hidden: self.env_hidden.clone(),
             active_overlays: self.active_overlays.clone(),
             recursion_count: self.recursion_count,
+            parent_stack: None,
+            parent_deletions: vec![],
         }
     }
 
